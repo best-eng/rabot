@@ -1,97 +1,141 @@
-import requests
-import pandas as pd
-import time
 import os
+import time
+import tempfile
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# === НАСТРОЙКИ ===
-BOT_TOKEN = "8551140583:AAEw3NOzoiRDWoV0Yoe7ZFfLBN3SLVog9ds"  # токен бота из SaleBot
-CHAT_ID = "1445696823"  # свой Telegram ID (можно узнать у @userinfobot)
-CSV_FILE = "table-modeli-pipe.csv"
-OUTPUT_FILE = "table-modeli-with-fileid.csv"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+CSV_FILE = os.getenv("CSV_FILE", "table-modeli-pipe.csv")
+OUTPUT_FILE = os.getenv("OUTPUT_FILE", "table-modeli-with-fileid.csv")
+SEND_RESULT_TO_TELEGRAM = os.getenv("SEND_RESULT_TO_TELEGRAM", "1") == "1"
 
+if not BOT_TOKEN or not CHAT_ID:
+    raise ValueError("Нужно задать BOT_TOKEN и CHAT_ID в переменных окружения")
 
-# ==================
+def build_session():
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+session = build_session()
 
 def get_yandex_direct_link(share_url):
-    """Получает прямую ссылку на скачивание с Яндекс Диска"""
     api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-    resp = requests.get(api_url, params={"public_key": share_url})
-    if resp.status_code == 200:
-        return resp.json().get("href")
-    return None
+    resp = session.get(api_url, params={"public_key": share_url}, timeout=(30, 120))
+    resp.raise_for_status()
+    return resp.json().get("href")
 
+def download_video(url, filepath):
+    with session.get(url, stream=True, timeout=(30, 600)) as resp:
+        resp.raise_for_status()
+        with open(filepath, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
-def download_video(url, filename):
-    """Скачивает видео по прямой ссылке"""
-    resp = requests.get(url, stream=True)
-    with open(filename, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-
-
-def upload_to_telegram(filepath):
-    """Загружает видео в Telegram и возвращает file_id"""
+def upload_to_telegram(filepath, caption=""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
     with open(filepath, "rb") as f:
-        resp = requests.post(url, data={"chat_id": CHAT_ID}, files={"video": f})
-    if resp.status_code == 200:
-        result = resp.json()
-        return result["result"]["video"]["file_id"]
-    else:
-        print(f"Ошибка загрузки: {resp.text}")
-        return None
+        resp = session.post(
+            url,
+            data={"chat_id": CHAT_ID, "caption": caption[:1024]},
+            files={"video": f},
+            timeout=(30, 1200),
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
+    return data["result"]["video"]["file_id"]
 
+def send_document(filepath, caption="Готовый CSV"):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    with open(filepath, "rb") as f:
+        resp = session.post(
+            url,
+            data={"chat_id": CHAT_ID, "caption": caption[:1024]},
+            files={"document": f},
+            timeout=(30, 1200),
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
 
-# Читаем таблицу
-df = pd.read_csv(CSV_FILE, sep=";", quotechar='"', encoding="utf-8")
+def is_telegram_file_id(value):
+    if not value or str(value).lower() == "nan":
+        return False
+    value = str(value).strip()
+    return value.startswith("BAAC") or value.startswith("AAM")
 
-for i, row in df.iterrows():
-    file_id = str(row["file_id"]).strip()
-    code = str(row["code_RF"]).strip()
+def main():
+    df = pd.read_csv(CSV_FILE, sep=";", quotechar='"', encoding="utf-8")
 
-    # Пропускаем строки где уже есть Telegram file_id
-    if file_id.startswith("BAAC"):
-        print(f"[{i}] {code} — уже есть file_id, пропускаем")
-        continue
+    for i, row in df.iterrows():
+        raw_file = str(row.get("file_id", "")).strip()
+        model_name = str(row.get("code_RF", "")).strip() or f"model_{i}"
 
-    # Пропускаем пустые
-    if not file_id or file_id == "nan":
-        print(f"[{i}] {code} — нет ссылки, пропускаем")
-        continue
-
-    print(f"[{i}] {code} — скачиваем с Яндекс Диска...")
-
-    try:
-        # Получаем прямую ссылку
-        direct_link = get_yandex_direct_link(file_id)
-        if not direct_link:
-            print(f"  ❌ Не удалось получить прямую ссылку")
+        if is_telegram_file_id(raw_file):
+            print(f"[{i}] {model_name} — уже есть Telegram file_id, пропуск")
             continue
 
-        # Скачиваем
-        tmp_file = f"tmp_{i}.mp4"
-        download_video(direct_link, tmp_file)
-        print(f"  ✅ Скачано")
+        if not raw_file or raw_file.lower() == "nan":
+            print(f"[{i}] {model_name} — пустой file_id, пропуск")
+            continue
 
-        # Загружаем в Telegram
-        print(f"  📤 Загружаем в Telegram...")
-        new_file_id = upload_to_telegram(tmp_file)
+        print(f"[{i}] {model_name} — получаем ссылку Яндекс.Диска")
+        temp_path = None
+        try:
+            direct_link = get_yandex_direct_link(raw_file)
+            if not direct_link:
+                print(f"[{i}] {model_name} — не удалось получить прямую ссылку")
+                continue
 
-        if new_file_id:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                temp_path = tmp.name
+
+            print(f"[{i}] {model_name} — скачиваем видео")
+            download_video(direct_link, temp_path)
+
+            caption = f"Модель: {model_name}"
+            print(f"[{i}] {model_name} — загружаем в Telegram")
+            new_file_id = upload_to_telegram(temp_path, caption=caption)
+
             df.at[i, "file_id"] = new_file_id
-            print(f"  ✅ file_id получен: {new_file_id[:30]}...")
-            # Сохраняем после каждой строки на случай обрыва
+            print(f"[{i}] {model_name} — OK: {new_file_id[:40]}...")
+
             df.to_csv(OUTPUT_FILE, sep=";", index=False, encoding="utf-8", quoting=1)
+            time.sleep(2)
 
-        # Удаляем временный файл
-        os.remove(tmp_file)
+        except Exception as e:
+            print(f"[{i}] {model_name} — ошибка: {e}")
 
-        # Пауза чтобы не получить бан от Telegram
-        time.sleep(3)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
-    except Exception as e:
-        print(f"  ❌ Ошибка: {e}")
-        continue
+    df.to_csv(OUTPUT_FILE, sep=";", index=False, encoding="utf-8", quoting=1)
+    print(f"Готово: {OUTPUT_FILE}")
 
-df.to_csv(OUTPUT_FILE, sep=";", index=False, encoding="utf-8", quoting=1)
-print(f"\n✅ Готово! Результат сохранён в {OUTPUT_FILE}")
+    if SEND_RESULT_TO_TELEGRAM and os.path.exists(OUTPUT_FILE):
+        send_document(OUTPUT_FILE, caption="Готовый CSV с file_id")
+        print("CSV отправлен в Telegram")
+
+if __name__ == "__main__":
+    main()
