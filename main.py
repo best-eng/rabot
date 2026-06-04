@@ -1,8 +1,11 @@
 import os
 import time
 import json
+import zipfile
 import tempfile
 import subprocess
+from pathlib import Path
+
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,6 +17,8 @@ CSV_FILE = os.getenv("CSV_FILE", "table-modeli-pipe.csv")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "table-modeli-with-fileid.csv")
 SEND_RESULT_TO_TELEGRAM = os.getenv("SEND_RESULT_TO_TELEGRAM", "1") == "1"
 FORCE_REUPLOAD = os.getenv("FORCE_REUPLOAD", "0") == "1"
+
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 
 if not BOT_TOKEN or not CHAT_ID:
     raise ValueError("Нужно задать BOT_TOKEN и CHAT_ID в переменных окружения")
@@ -59,6 +64,18 @@ def get_yandex_direct_link(share_url):
     print(f"Yandex API href: {href}")
     return href
 
+def is_video_content_type(content_type):
+    content_type = (content_type or "").lower()
+    return content_type.startswith("video/") or content_type in {"application/octet-stream"}
+
+def is_zip_content_type(content_type):
+    content_type = (content_type or "").lower()
+    return "zip" in content_type or content_type in {
+        "application/zip",
+        "application/x-zip-compressed",
+        "multipart/x-zip",
+    }
+
 def download_video(url, filepath):
     with session.get(url, stream=True, timeout=(30, 600), allow_redirects=True) as resp:
         resp.raise_for_status()
@@ -75,6 +92,12 @@ def download_video(url, filepath):
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+
+        return {
+            "content_type": content_type,
+            "content_length": content_length,
+            "final_url": final_url,
+        }
 
 def probe_video(filepath):
     cmd = [
@@ -126,6 +149,57 @@ def validate_video_file(filepath):
     print(f"format_name: {format_name}, duration: {duration}, size: {size}")
 
     return True, "OK"
+
+def extract_video_from_zip(zip_path, extract_dir):
+    if not zipfile.is_zipfile(zip_path):
+        return None
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        members = zf.infolist()
+
+        print("Файлы внутри ZIP:")
+        for m in members:
+            if not m.is_dir():
+                print(f" - {m.filename}")
+
+        candidates = []
+        for m in members:
+            if m.is_dir():
+                continue
+            ext = Path(m.filename).suffix.lower()
+            if ext in VIDEO_EXTS:
+                candidates.append(m)
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x.file_size, reverse=True)
+        target = candidates[0]
+
+        print(f"Выбран файл из ZIP: {target.filename}, size={target.file_size}")
+
+        extracted_path = zf.extract(target, path=extract_dir)
+        return extracted_path
+
+def prepare_input_media(downloaded_path, content_type):
+    if is_video_content_type(content_type):
+        return downloaded_path, None
+
+    if is_zip_content_type(content_type):
+        extract_dir = tempfile.mkdtemp(prefix="unzipped_media_")
+        extracted_video = extract_video_from_zip(downloaded_path, extract_dir)
+        if not extracted_video:
+            raise ValueError("ZIP скачан, но внутри не найден видеофайл")
+        return extracted_video, extract_dir
+
+    if zipfile.is_zipfile(downloaded_path):
+        extract_dir = tempfile.mkdtemp(prefix="unzipped_media_")
+        extracted_video = extract_video_from_zip(downloaded_path, extract_dir)
+        if not extracted_video:
+            raise ValueError("Файл похож на ZIP, но внутри не найдено видео")
+        return extracted_video, extract_dir
+
+    raise ValueError(f"Неподдерживаемый Content-Type: {content_type}")
 
 def convert_video_for_telegram(input_path, output_path):
     cmd = [
@@ -194,7 +268,7 @@ def main():
                 print(f"[{i}] {model_name} — уже есть Telegram file_id, пропуск")
                 continue
             else:
-                print(f"[{i}] {model_name} — FORCE_REUPLOAD=1, но в file_id уже Telegram id, скачать заново неоткуда")
+                print(f"[{i}] {model_name} — FORCE_REUPLOAD=1, но уже есть Telegram file_id, пропуск")
                 continue
 
         if not raw_file or raw_file.lower() == "nan":
@@ -202,7 +276,10 @@ def main():
             continue
 
         print(f"[{i}] {model_name} — получаем ссылку Яндекс.Диска")
+
         temp_path = None
+        prepared_input_path = None
+        prepared_extract_dir = None
         converted_path = None
 
         try:
@@ -211,22 +288,30 @@ def main():
                 print(f"[{i}] {model_name} — не удалось получить прямую ссылку")
                 continue
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
                 temp_path = tmp.name
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp2:
                 converted_path = tmp2.name
 
-            print(f"[{i}] {model_name} — скачиваем видео")
-            download_video(direct_link, temp_path)
+            print(f"[{i}] {model_name} — скачиваем файл")
+            download_info = download_video(direct_link, temp_path)
 
-            ok, message = validate_video_file(temp_path)
+            print(f"[{i}] {model_name} — подготавливаем входной медиафайл")
+            prepared_input_path, prepared_extract_dir = prepare_input_media(
+                temp_path,
+                download_info.get("content_type", "")
+            )
+
+            print(f"[{i}] {model_name} — входной файл: {prepared_input_path}")
+
+            ok, message = validate_video_file(prepared_input_path)
             if not ok:
                 print(f"[{i}] {model_name} — файл невалиден: {message}")
                 continue
 
             print(f"[{i}] {model_name} — конвертируем видео для Telegram")
-            convert_video_for_telegram(temp_path, converted_path)
+            convert_video_for_telegram(prepared_input_path, converted_path)
 
             ok2, message2 = validate_video_file(converted_path)
             if not ok2:
@@ -256,6 +341,23 @@ def main():
                         os.remove(p)
                     except Exception:
                         pass
+
+            if prepared_extract_dir and os.path.exists(prepared_extract_dir):
+                try:
+                    for root, dirs, files in os.walk(prepared_extract_dir, topdown=False):
+                        for name in files:
+                            try:
+                                os.remove(os.path.join(root, name))
+                            except Exception:
+                                pass
+                        for name in dirs:
+                            try:
+                                os.rmdir(os.path.join(root, name))
+                            except Exception:
+                                pass
+                    os.rmdir(prepared_extract_dir)
+                except Exception:
+                    pass
 
     df.to_csv(OUTPUT_FILE, sep=";", index=False, encoding="utf-8", quoting=1)
     print(f"Готово: {OUTPUT_FILE}")
