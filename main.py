@@ -1,17 +1,3 @@
-import subprocess, sys
-
-def install_system_deps():
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-    except Exception:
-        print("ffmpeg не найден, устанавливаем...")
-        subprocess.run(
-            ["apt-get", "install", "-y", "--no-install-recommends", "ffmpeg"],
-            check=True
-        )
-
-install_system_deps()
-
 import os
 import time
 import json
