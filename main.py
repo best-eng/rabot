@@ -1,6 +1,7 @@
 import os
 import time
 import tempfile
+import subprocess
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -46,6 +47,23 @@ def download_video(url, filepath):
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+
+def convert_video_for_telegram(input_path, output_path):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-preset", "faster",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "baseline",
+        "-movflags", "+faststart",
+        "-c:a", "aac",
+        "-ac", "2",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True)
 
 def upload_to_telegram(filepath, caption=""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
@@ -103,6 +121,8 @@ def main():
 
         print(f"[{i}] {model_name} — получаем ссылку Яндекс.Диска")
         temp_path = None
+        converted_path = None
+
         try:
             direct_link = get_yandex_direct_link(raw_file)
             if not direct_link:
@@ -112,12 +132,18 @@ def main():
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
                 temp_path = tmp.name
 
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp2:
+                converted_path = tmp2.name
+
             print(f"[{i}] {model_name} — скачиваем видео")
             download_video(direct_link, temp_path)
 
+            print(f"[{i}] {model_name} — конвертируем видео для Telegram")
+            convert_video_for_telegram(temp_path, converted_path)
+
             caption = f"Модель: {model_name}"
             print(f"[{i}] {model_name} — загружаем в Telegram")
-            new_file_id = upload_to_telegram(temp_path, caption=caption)
+            new_file_id = upload_to_telegram(converted_path, caption=caption)
 
             df.at[i, "file_id"] = new_file_id
             print(f"[{i}] {model_name} — OK: {new_file_id[:40]}...")
@@ -125,15 +151,19 @@ def main():
             df.to_csv(OUTPUT_FILE, sep=";", index=False, encoding="utf-8", quoting=1)
             time.sleep(2)
 
+        except subprocess.CalledProcessError as e:
+            print(f"[{i}] {model_name} — ошибка ffmpeg: {e}")
+
         except Exception as e:
             print(f"[{i}] {model_name} — ошибка: {e}")
 
         finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
+            for p in [temp_path, converted_path]:
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
     df.to_csv(OUTPUT_FILE, sep=";", index=False, encoding="utf-8", quoting=1)
     print(f"Готово: {OUTPUT_FILE}")
