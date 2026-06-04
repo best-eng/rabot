@@ -196,9 +196,6 @@ def validate_video_file(filepath):
     if codec_name not in {"h264", "hevc", "mpeg4", "vp9", "av1"}:
         print(f"Предупреждение: необычный кодек видео: {codec_name}")
 
-    if "mp4" not in (format_name or "") and "mov" not in (format_name or "") and "matroska" not in (format_name or ""):
-        print(f"Предупреждение: необычный контейнер: {format_name}")
-
     if pix_fmt and pix_fmt != "yuv420p":
         print(f"Предупреждение: pix_fmt={pix_fmt}, для Telegram лучше yuv420p")
 
@@ -255,7 +252,15 @@ def prepare_input_media(downloaded_path, content_type):
 
     raise ValueError(f"Неподдерживаемый Content-Type: {content_type}")
 
-def convert_video_for_telegram(input_path, output_path):
+def ffmpeg_run(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+        return False, result
+    return True, result
+
+def convert_video_primary(input_path, output_path):
     cmd = [
         "ffmpeg",
         "-y",
@@ -263,47 +268,83 @@ def convert_video_for_telegram(input_path, output_path):
         "-analyzeduration", "100M",
         "-probesize", "100M",
         "-i", input_path,
-
         "-map", "0:v:0",
         "-map", "0:a:0?",
-
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-profile:v", "baseline",
         "-level", "3.1",
-
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-r", "25",
         "-g", "50",
         "-keyint_min", "25",
         "-sc_threshold", "0",
-
         "-maxrate", "4500k",
         "-bufsize", "9000k",
         "-max_muxing_queue_size", "9999",
-
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "44100",
         "-ac", "2",
-
         "-movflags", "+faststart",
         "-f", "mp4",
         output_path,
     ]
-
-    print("FFmpeg command:")
+    print("FFmpeg primary command:")
     print(" ".join(cmd))
+    return ffmpeg_run(cmd)[0]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(result.stdout)
-        print(result.stderr)
-        raise subprocess.CalledProcessError(
-            result.returncode, cmd, output=result.stdout, stderr=result.stderr
-        )
+def convert_video_fallback(input_path, output_path):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-fflags", "+genpts",
+        "-analyzeduration", "100M",
+        "-probesize", "100M",
+        "-i", input_path,
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c:v", "libx264",
+        "-preset", "slow",
+        "-crf", "26",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "baseline",
+        "-level", "3.0",
+        "-vf", "scale='if(gt(iw,1280),1280,iw)':-2:flags=lanczos,format=yuv420p",
+        "-r", "24",
+        "-g", "48",
+        "-keyint_min", "24",
+        "-sc_threshold", "0",
+        "-maxrate", "3000k",
+        "-bufsize", "6000k",
+        "-max_muxing_queue_size", "9999",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-ar", "44100",
+        "-ac", "2",
+        "-movflags", "+faststart",
+        "-f", "mp4",
+        output_path,
+    ]
+    print("FFmpeg fallback command:")
+    print(" ".join(cmd))
+    return ffmpeg_run(cmd)[0]
+
+def encode_with_fallback(input_path, output_path):
+    if convert_video_primary(input_path, output_path):
+        ok, _ = validate_video_file(output_path)
+        if ok:
+            return True
+
+    print("Первичная конвертация не подошла, пробуем fallback...")
+    if convert_video_fallback(input_path, output_path):
+        ok, _ = validate_video_file(output_path)
+        if ok:
+            return True
+
+    return False
 
 def upload_to_telegram(filepath, caption=""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
@@ -359,8 +400,7 @@ def main():
                 print(f"[{i}] {model_name} — уже есть Telegram file_id, пропуск")
                 continue
             else:
-                print(f"[{i}] {model_name} — FORCE_REUPLOAD=1, но уже есть Telegram file_id, пропуск")
-                continue
+                print(f"[{i}] {model_name} — FORCE_REUPLOAD=1, перезаливаем")
 
         if not raw_file or raw_file.lower() == "nan":
             print(f"[{i}] {model_name} — пустой file_id, пропуск")
@@ -403,7 +443,9 @@ def main():
                 continue
 
             print(f"[{i}] {model_name} — конвертируем видео для Telegram")
-            convert_video_for_telegram(prepared_input_path, converted_path)
+            if not encode_with_fallback(prepared_input_path, converted_path):
+                print(f"[{i}] {model_name} — обе конвертации не дали валидный результат")
+                continue
 
             print_video_diagnostics(converted_path, label=f"[{i}] {model_name} — диагностика результата")
 
