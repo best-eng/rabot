@@ -351,19 +351,58 @@ def encode_with_fallback(input_path, output_path):
 
     return False
 
-def upload_to_telegram(filepath, caption=""):
+def generate_thumbnail(video_path, thumb_path, second=6):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(second),
+        "-i", video_path,
+        "-frames:v", "1",
+        "-q:v", "2",
+        "-vf", "scale='min(320,iw)':-2",
+        thumb_path,
+    ]
+    print("FFmpeg thumbnail command:")
+    print(" ".join(cmd))
+
+    ok, _ = ffmpeg_run(cmd)
+    if not ok:
+        return False
+
+    if not os.path.exists(thumb_path):
+        return False
+
+    if os.path.getsize(thumb_path) == 0:
+        return False
+
+    return True
+
+def upload_to_telegram(filepath, caption="", thumb_path=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-    with open(filepath, "rb") as f:
-        resp = session.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "caption": caption[:1024],
-                "supports_streaming": True,
-            },
-            files={"video": f},
-            timeout=(30, 1200),
-        )
+
+    with open(filepath, "rb") as video_file:
+        files = {"video": video_file}
+
+        thumb_file = None
+        try:
+            if thumb_path and os.path.exists(thumb_path):
+                thumb_file = open(thumb_path, "rb")
+                files["thumb"] = thumb_file
+
+            resp = session.post(
+                url,
+                data={
+                    "chat_id": CHAT_ID,
+                    "caption": caption[:1024],
+                    "supports_streaming": True,
+                },
+                files=files,
+                timeout=(30, 1200),
+            )
+        finally:
+            if thumb_file:
+                thumb_file.close()
+
     resp.raise_for_status()
     data = resp.json()
     if not data.get("ok"):
@@ -417,6 +456,7 @@ def main():
         prepared_input_path = None
         prepared_extract_dir = None
         converted_path = None
+        thumb_path = None
 
         try:
             direct_link = get_yandex_direct_link(raw_file)
@@ -429,6 +469,9 @@ def main():
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp2:
                 converted_path = tmp2.name
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp3:
+                thumb_path = tmp3.name
 
             print(f"[{i}] {model_name} — скачиваем файл")
             download_info = download_video(direct_link, temp_path)
@@ -459,12 +502,18 @@ def main():
                 print(f"[{i}] {model_name} — сконвертированный файл невалиден: {message2}")
                 continue
 
+            print(f"[{i}] {model_name} — генерируем превью на 6 секунде")
+            thumb_ok = generate_thumbnail(converted_path, thumb_path, second=6)
+            if not thumb_ok:
+                print(f"[{i}] {model_name} — не удалось создать превью, отправим без него")
+                thumb_path = None
+
             converted_size = os.path.getsize(converted_path)
             print(f"[{i}] {model_name} — размер после конвертации: {converted_size} байт")
 
             caption = f"Модель: {model_name}"
             print(f"[{i}] {model_name} — загружаем в Telegram")
-            new_file_id = upload_to_telegram(converted_path, caption=caption)
+            new_file_id = upload_to_telegram(converted_path, caption=caption, thumb_path=thumb_path)
 
             df.at[i, "file_id"] = new_file_id
             print(f"[{i}] {model_name} — OK: {new_file_id[:40]}...")
@@ -482,7 +531,7 @@ def main():
             print(f"[{i}] {model_name} — ошибка: {e}")
 
         finally:
-            for p in [temp_path, converted_path]:
+            for p in [temp_path, converted_path, thumb_path]:
                 if p and os.path.exists(p):
                     try:
                         os.remove(p)
