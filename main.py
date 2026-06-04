@@ -111,12 +111,49 @@ def probe_video(filepath):
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode, result.stdout, result.stderr
 
+def get_video_meta(filepath):
+    code, out, err = probe_video(filepath)
+    if code != 0:
+        raise RuntimeError(f"ffprobe error: {err}")
+    return json.loads(out)
+
+def print_video_diagnostics(filepath, label="Файл"):
+    meta = get_video_meta(filepath)
+    format_info = meta.get("format", {})
+    streams = meta.get("streams", [])
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    print(f"{label}: {filepath}")
+    print("FORMAT:", json.dumps(format_info, ensure_ascii=False))
+
+    if video_stream:
+        print("VIDEO:", json.dumps({
+            "codec_name": video_stream.get("codec_name"),
+            "profile": video_stream.get("profile"),
+            "width": video_stream.get("width"),
+            "height": video_stream.get("height"),
+            "pix_fmt": video_stream.get("pix_fmt"),
+            "r_frame_rate": video_stream.get("r_frame_rate"),
+            "avg_frame_rate": video_stream.get("avg_frame_rate"),
+            "bit_rate": video_stream.get("bit_rate"),
+            "level": video_stream.get("level"),
+        }, ensure_ascii=False))
+
+    if audio_stream:
+        print("AUDIO:", json.dumps({
+            "codec_name": audio_stream.get("codec_name"),
+            "sample_rate": audio_stream.get("sample_rate"),
+            "channels": audio_stream.get("channels"),
+            "bit_rate": audio_stream.get("bit_rate"),
+        }, ensure_ascii=False))
+
 def validate_video_file(filepath):
     if not os.path.exists(filepath):
         return False, "Файл не существует"
 
     file_size = os.path.getsize(filepath)
-    print(f"Размер скачанного файла: {file_size} байт")
+    print(f"Размер файла: {file_size} байт")
 
     if file_size == 0:
         return False, "Файл пустой"
@@ -145,8 +182,25 @@ def validate_video_file(filepath):
     duration = format_info.get("duration")
     size = format_info.get("size")
     format_name = format_info.get("format_name")
-
     print(f"format_name: {format_name}, duration: {duration}, size: {size}")
+
+    v = video_streams[0]
+    width = int(v.get("width", 0) or 0)
+    height = int(v.get("height", 0) or 0)
+    pix_fmt = (v.get("pix_fmt") or "").lower()
+    codec_name = (v.get("codec_name") or "").lower()
+
+    if width <= 0 or height <= 0:
+        return False, "Некорректные размеры видео"
+
+    if codec_name not in {"h264", "hevc", "mpeg4", "vp9", "av1"}:
+        print(f"Предупреждение: необычный кодек видео: {codec_name}")
+
+    if "mp4" not in (format_name or "") and "mov" not in (format_name or "") and "matroska" not in (format_name or ""):
+        print(f"Предупреждение: необычный контейнер: {format_name}")
+
+    if pix_fmt and pix_fmt != "yuv420p":
+        print(f"Предупреждение: pix_fmt={pix_fmt}, для Telegram лучше yuv420p")
 
     return True, "OK"
 
@@ -205,25 +259,62 @@ def convert_video_for_telegram(input_path, output_path):
     cmd = [
         "ffmpeg",
         "-y",
+        "-fflags", "+genpts",
+        "-analyzeduration", "100M",
+        "-probesize", "100M",
         "-i", input_path,
+
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+
         "-c:v", "libx264",
-        "-preset", "faster",
+        "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-profile:v", "baseline",
-        "-movflags", "+faststart",
+        "-level", "3.1",
+
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-r", "25",
+        "-g", "50",
+        "-keyint_min", "25",
+        "-sc_threshold", "0",
+
+        "-maxrate", "4500k",
+        "-bufsize", "9000k",
+        "-max_muxing_queue_size", "9999",
+
         "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
         "-ac", "2",
+
+        "-movflags", "+faststart",
+        "-f", "mp4",
         output_path,
     ]
-    subprocess.run(cmd, check=True)
+
+    print("FFmpeg command:")
+    print(" ".join(cmd))
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, output=result.stdout, stderr=result.stderr
+        )
 
 def upload_to_telegram(filepath, caption=""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
     with open(filepath, "rb") as f:
         resp = session.post(
             url,
-            data={"chat_id": CHAT_ID, "caption": caption[:1024]},
+            data={
+                "chat_id": CHAT_ID,
+                "caption": caption[:1024],
+                "supports_streaming": True,
+            },
             files={"video": f},
             timeout=(30, 1200),
         )
@@ -304,6 +395,7 @@ def main():
             )
 
             print(f"[{i}] {model_name} — входной файл: {prepared_input_path}")
+            print_video_diagnostics(prepared_input_path, label=f"[{i}] {model_name} — диагностика исходника")
 
             ok, message = validate_video_file(prepared_input_path)
             if not ok:
@@ -313,10 +405,15 @@ def main():
             print(f"[{i}] {model_name} — конвертируем видео для Telegram")
             convert_video_for_telegram(prepared_input_path, converted_path)
 
+            print_video_diagnostics(converted_path, label=f"[{i}] {model_name} — диагностика результата")
+
             ok2, message2 = validate_video_file(converted_path)
             if not ok2:
                 print(f"[{i}] {model_name} — сконвертированный файл невалиден: {message2}")
                 continue
+
+            converted_size = os.path.getsize(converted_path)
+            print(f"[{i}] {model_name} — размер после конвертации: {converted_size} байт")
 
             caption = f"Модель: {model_name}"
             print(f"[{i}] {model_name} — загружаем в Telegram")
@@ -330,6 +427,9 @@ def main():
 
         except subprocess.CalledProcessError as e:
             print(f"[{i}] {model_name} — ошибка ffmpeg: {e}")
+            if getattr(e, "stderr", None):
+                print("ffmpeg stderr:")
+                print(e.stderr)
 
         except Exception as e:
             print(f"[{i}] {model_name} — ошибка: {e}")
