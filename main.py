@@ -7,6 +7,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import subprocess
+print(subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True).stdout)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CSV_FILE = os.getenv("CSV_FILE", "table-modeli-pipe.csv")
