@@ -11,6 +11,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 CSV_FILE = os.getenv("CSV_FILE", "table-modeli-pipe.csv")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "table-modeli-with-fileid.csv")
 SEND_RESULT_TO_TELEGRAM = os.getenv("SEND_RESULT_TO_TELEGRAM", "1") == "1"
+FORCE_REUPLOAD = os.getenv("FORCE_REUPLOAD", "0") == "1"
 
 if not BOT_TOKEN or not CHAT_ID:
     raise ValueError("Нужно задать BOT_TOKEN и CHAT_ID в переменных окружения")
@@ -89,8 +90,12 @@ def main():
         model_name = str(row.get("code_RF", "")).strip() or f"model_{i}"
 
         if is_telegram_file_id(raw_file):
-            print(f"[{i}] {model_name} — уже есть Telegram file_id, пропуск")
-            continue
+            if not FORCE_REUPLOAD:
+                print(f"[{i}] {model_name} — уже есть Telegram file_id, пропуск")
+                continue
+            else:
+                print(f"[{i}] {model_name} — FORCE_REUPLOAD=1, но в file_id уже Telegram id, скачать заново неоткуда")
+                continue
 
         if not raw_file or raw_file.lower() == "nan":
             print(f"[{i}] {model_name} — пустой file_id, пропуск")
