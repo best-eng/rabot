@@ -1,3 +1,8 @@
+import shutil, os
+print("PATH =", os.environ.get("PATH"))
+print("ffmpeg =", shutil.which("ffmpeg"))
+print("ffprobe =", shutil.which("ffprobe"))
+
 import os
 import time
 import json
