@@ -28,6 +28,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 if not BOT_TOKEN or not CHAT_ID:
     raise ValueError("Нужно задать BOT_TOKEN и CHAT_ID в переменных окружения")
 
+
 def build_session():
     session = requests.Session()
     retries = Retry(
@@ -43,7 +44,9 @@ def build_session():
     session.mount("https://", adapter)
     return session
 
+
 session = build_session()
+
 
 def check_ffmpeg():
     try:
@@ -60,6 +63,7 @@ def check_ffmpeg():
         print(f"FFmpeg не найден или не запускается: {e}")
         return False
 
+
 def get_yandex_direct_link(share_url):
     api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
     resp = session.get(api_url, params={"public_key": share_url}, timeout=(30, 120))
@@ -69,9 +73,11 @@ def get_yandex_direct_link(share_url):
     print(f"Yandex API href: {href}")
     return href
 
+
 def is_video_content_type(content_type):
     content_type = (content_type or "").lower()
     return content_type.startswith("video/") or content_type in {"application/octet-stream"}
+
 
 def is_zip_content_type(content_type):
     content_type = (content_type or "").lower()
@@ -80,6 +86,7 @@ def is_zip_content_type(content_type):
         "application/x-zip-compressed",
         "multipart/x-zip",
     }
+
 
 def download_video(url, filepath):
     with session.get(url, stream=True, timeout=(30, 600), allow_redirects=True) as resp:
@@ -104,6 +111,7 @@ def download_video(url, filepath):
             "final_url": final_url,
         }
 
+
 def probe_video(filepath):
     cmd = [
         "ffprobe",
@@ -116,11 +124,13 @@ def probe_video(filepath):
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode, result.stdout, result.stderr
 
+
 def get_video_meta(filepath):
     code, out, err = probe_video(filepath)
     if code != 0:
         raise RuntimeError(f"ffprobe error: {err}")
     return json.loads(out)
+
 
 def print_video_diagnostics(filepath, label="Файл"):
     meta = get_video_meta(filepath)
@@ -152,6 +162,7 @@ def print_video_diagnostics(filepath, label="Файл"):
             "channels": audio_stream.get("channels"),
             "bit_rate": audio_stream.get("bit_rate"),
         }, ensure_ascii=False))
+
 
 def validate_video_file(filepath):
     if not os.path.exists(filepath):
@@ -206,6 +217,77 @@ def validate_video_file(filepath):
 
     return True, "OK"
 
+
+def get_video_dimensions(filepath):
+    """
+    Получить реальные ширину и высоту видео через ffprobe.
+    Учитывает тег rotate: если видео физически повёрнуто на 90/270 градусов,
+    меняет местами width и height, чтобы Telegram отобразил правильные пропорции.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,tags",
+        "-of", "json",
+        filepath,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"get_video_dimensions: ffprobe error: {result.stderr}")
+        return None, None
+
+    try:
+        data = json.loads(result.stdout)
+    except Exception as e:
+        print(f"get_video_dimensions: JSON parse error: {e}")
+        return None, None
+
+    streams = data.get("streams", [])
+    if not streams:
+        return None, None
+
+    s = streams[0]
+    w = s.get("width")
+    h = s.get("height")
+
+    # Проверяем тег rotate
+    tags = s.get("tags", {}) or {}
+    rotate = int(tags.get("rotate", 0) or 0)
+    print(f"Размеры видео из ffprobe: {w}x{h}, rotate tag: {rotate}")
+
+    # Если видео повёрнуто на 90 или 270 — меняем местами для Telegram
+    if rotate in (90, 270, -90, -270):
+        w, h = h, w
+        print(f"Размеры после учёта rotate: {w}x{h}")
+
+    return w, h
+
+
+def get_video_rotate_tag(filepath):
+    """Возвращает значение тега rotate (0, 90, 180, 270) для видео-потока."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream_tags=rotate",
+        "-of", "json",
+        filepath,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return 0
+    try:
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        if streams:
+            tags = streams[0].get("tags", {}) or {}
+            return int(tags.get("rotate", 0) or 0)
+    except Exception:
+        pass
+    return 0
+
+
 def extract_video_from_zip(zip_path, extract_dir):
     if not zipfile.is_zipfile(zip_path):
         return None
@@ -237,6 +319,7 @@ def extract_video_from_zip(zip_path, extract_dir):
         extracted_path = zf.extract(target, path=extract_dir)
         return extracted_path
 
+
 def prepare_input_media(downloaded_path, content_type):
     if is_video_content_type(content_type):
         return downloaded_path, None
@@ -257,6 +340,7 @@ def prepare_input_media(downloaded_path, content_type):
 
     raise ValueError(f"Неподдерживаемый Content-Type: {content_type}")
 
+
 def ffmpeg_run(cmd):
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -265,7 +349,32 @@ def ffmpeg_run(cmd):
         return False, result
     return True, result
 
+
+def build_vf_filter(input_path):
+    """
+    Строит строку -vf с учётом тега rotate.
+    Если rotate=90/270 — добавляем transpose для физического поворота пикселей,
+    и сбрасываем тег rotate=0, чтобы Telegram не запутался.
+    """
+    rotate = get_video_rotate_tag(input_path)
+    base_scale = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+    if rotate == 90:
+        vf = f"transpose=1,{base_scale}"
+    elif rotate == 180:
+        vf = f"transpose=1,transpose=1,{base_scale}"
+    elif rotate == 270 or rotate == -90:
+        vf = f"transpose=2,{base_scale}"
+    else:
+        vf = base_scale
+
+    print(f"VF filter: {vf} (rotate tag was: {rotate})")
+    return vf, rotate
+
+
 def convert_video_primary(input_path, output_path):
+    vf, rotate = build_vf_filter(input_path)
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -281,7 +390,7 @@ def convert_video_primary(input_path, output_path):
         "-pix_fmt", "yuv420p",
         "-profile:v", "baseline",
         "-level", "3.1",
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-vf", vf,
         "-r", "25",
         "-g", "50",
         "-keyint_min", "25",
@@ -297,11 +406,24 @@ def convert_video_primary(input_path, output_path):
         "-f", "mp4",
         output_path,
     ]
+
+    # Если был rotate-тег — сбрасываем его в выходном файле
+    if rotate != 0:
+        cmd.insert(-1, "-metadata:s:v")
+        cmd.insert(-1, "rotate=0")
+
     print("FFmpeg primary command:")
     print(" ".join(cmd))
     return ffmpeg_run(cmd)[0]
 
+
 def convert_video_fallback(input_path, output_path):
+    vf, rotate = build_vf_filter(input_path)
+    # В fallback масштабируем с ограничением ширины
+    vf_fallback = f"scale='if(gt(iw,1280),1280,iw)':-2:flags=lanczos,format=yuv420p"
+    if rotate in (90, 270, -90):
+        vf_fallback = f"transpose={'1' if rotate==90 else '2'}," + vf_fallback
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -317,7 +439,7 @@ def convert_video_fallback(input_path, output_path):
         "-pix_fmt", "yuv420p",
         "-profile:v", "baseline",
         "-level", "3.0",
-        "-vf", "scale='if(gt(iw,1280),1280,iw)':-2:flags=lanczos,format=yuv420p",
+        "-vf", vf_fallback,
         "-r", "24",
         "-g", "48",
         "-keyint_min", "24",
@@ -333,9 +455,15 @@ def convert_video_fallback(input_path, output_path):
         "-f", "mp4",
         output_path,
     ]
+
+    if rotate != 0:
+        cmd.insert(-1, "-metadata:s:v")
+        cmd.insert(-1, "rotate=0")
+
     print("FFmpeg fallback command:")
     print(" ".join(cmd))
     return ffmpeg_run(cmd)[0]
+
 
 def encode_with_fallback(input_path, output_path):
     if convert_video_primary(input_path, output_path):
@@ -351,51 +479,75 @@ def encode_with_fallback(input_path, output_path):
 
     return False
 
+
 def generate_thumbnail(video_path, thumb_path, second=6):
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-ss", str(second),
-        "-i", video_path,
-        "-frames:v", "1",
-        "-q:v", "2",
-        "-vf", "scale='min(320,iw)':-2",
-        thumb_path,
-    ]
-    print("FFmpeg thumbnail command:")
-    print(" ".join(cmd))
+    quality_steps = ["3", "5", "7", "10"]
 
-    ok, _ = ffmpeg_run(cmd)
-    if not ok:
-        return False
+    for q in quality_steps:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss", str(second),
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+            "-q:v", q,
+            "-an",
+            "-sn",
+            thumb_path,
+        ]
+        print("FFmpeg thumbnail command:")
+        print(" ".join(cmd))
 
-    if not os.path.exists(thumb_path):
-        return False
+        ok, _ = ffmpeg_run(cmd)
+        if not ok:
+            continue
 
-    if os.path.getsize(thumb_path) == 0:
-        return False
+        if not os.path.exists(thumb_path):
+            continue
 
-    return True
+        size = os.path.getsize(thumb_path)
+        print(f"Thumbnail size: {size} bytes")
+
+        if size == 0:
+            continue
+
+        if size < 200 * 1024:
+            return True
+
+    return False
+
 
 def upload_to_telegram(filepath, caption="", thumb_path=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
 
-    with open(filepath, "rb") as video_file:
-        files = {"video": video_file}
+    # Получаем реальные размеры с учётом rotate-тега
+    width, height = get_video_dimensions(filepath)
 
+    with open(filepath, "rb") as video_file:
+        files = {"video": ("video.mp4", video_file, "video/mp4")}
         thumb_file = None
+
         try:
             if thumb_path and os.path.exists(thumb_path):
                 thumb_file = open(thumb_path, "rb")
-                files["thumb"] = thumb_file
+                files["thumb"] = ("thumb.jpg", thumb_file, "image/jpeg")
+
+            data_payload = {
+                "chat_id": CHAT_ID,
+                "caption": caption[:1024],
+                "supports_streaming": True,
+            }
+
+            # Явно передаём ширину и высоту — Telegram не будет угадывать пропорции
+            if width and height:
+                data_payload["width"] = width
+                data_payload["height"] = height
+                print(f"Отправляем в Telegram: width={width}, height={height}")
 
             resp = session.post(
                 url,
-                data={
-                    "chat_id": CHAT_ID,
-                    "caption": caption[:1024],
-                    "supports_streaming": True,
-                },
+                data=data_payload,
                 files=files,
                 timeout=(30, 1200),
             )
@@ -408,6 +560,7 @@ def upload_to_telegram(filepath, caption="", thumb_path=None):
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data}")
     return data["result"]["video"]["file_id"]
+
 
 def send_document(filepath, caption="Готовый CSV"):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
@@ -423,11 +576,13 @@ def send_document(filepath, caption="Готовый CSV"):
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data}")
 
+
 def is_telegram_file_id(value):
     if not value or str(value).lower() == "nan":
         return False
     value = str(value).strip()
     return value.startswith("BAAC") or value.startswith("AAM")
+
 
 def main():
     if not check_ffmpeg():
@@ -505,8 +660,10 @@ def main():
             print(f"[{i}] {model_name} — генерируем превью на 6 секунде")
             thumb_ok = generate_thumbnail(converted_path, thumb_path, second=6)
             if not thumb_ok:
-                print(f"[{i}] {model_name} — не удалось создать превью, отправим без него")
+                print(f"[{i}] {model_name} — не удалось создать подходящее превью (<200KB JPEG 320px), отправим без него")
                 thumb_path = None
+            else:
+                print(f"[{i}] {model_name} — превью готово: {thumb_path}")
 
             converted_size = os.path.getsize(converted_path)
             print(f"[{i}] {model_name} — размер после конвертации: {converted_size} байт")
@@ -561,6 +718,7 @@ def main():
     if SEND_RESULT_TO_TELEGRAM and os.path.exists(OUTPUT_FILE):
         send_document(OUTPUT_FILE, caption="Готовый CSV с file_id")
         print("CSV отправлен в Telegram")
+
 
 if __name__ == "__main__":
     main()
